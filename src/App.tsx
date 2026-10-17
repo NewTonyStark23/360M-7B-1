@@ -2,8 +2,12 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { ElasticTransformer, ELASTIC_CONFIG } from './ml/elastic-transformer';
 import { Tensor } from './ml/tensor';
 import { getAllPretrainData, generateTrainingChunks } from './ml/qwen3-data';
+import { AtomicMindGraph } from './ml/atomic-mind';
+import { WordPredictor } from './ml/word-predictor';
+import { DictionaryEngine } from './ml/dictionary-engine';
+import { SelfVetter } from './ml/self-vetter';
 
-type Tab = 'overview' | 'train' | 'generate' | 'architecture' | 'export';
+type Tab = 'overview' | 'train' | 'generate' | 'mind' | 'predict' | 'architecture' | 'export';
 
 interface TrainingState {
   isTraining: boolean;
@@ -25,6 +29,10 @@ interface ModelState {
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const [model, setModel] = useState<ElasticTransformer | null>(null);
+  const [atomicMind, setAtomicMind] = useState<AtomicMindGraph | null>(null);
+  const [wordPredictor, setWordPredictor] = useState<WordPredictor | null>(null);
+  const [dictionary, setDictionary] = useState<DictionaryEngine | null>(null);
+  const [selfVetter, setSelfVetter] = useState<SelfVetter | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
   const [modelState, setModelState] = useState<ModelState | null>(null);
 
@@ -50,7 +58,16 @@ function App() {
 
   const initializeModel = useCallback(() => {
     const newModel = new ElasticTransformer();
+    const newAtomicMind = new AtomicMindGraph();
+    const newWordPredictor = new WordPredictor();
+    const newDictionary = new DictionaryEngine();
+    const newSelfVetter = new SelfVetter();
+    
     setModel(newModel);
+    setAtomicMind(newAtomicMind);
+    setWordPredictor(newWordPredictor);
+    setDictionary(newDictionary);
+    setSelfVetter(newSelfVetter);
     modelRef.current = newModel;
     setModelState(newModel.getState());
     setIsInitialized(true);
@@ -199,6 +216,8 @@ function App() {
               ['overview', '🏠 Overview'],
               ['train', '🔥 Train'],
               ['generate', '✨ Generate'],
+              ['mind', '🧠 Atomic Mind'],
+              ['predict', '⚡ Predict'],
               ['architecture', '🧬 Architecture'],
               ['export', '📦 Export'],
             ] as [Tab, string][]).map(([tab, label]) => (
@@ -225,7 +244,9 @@ function App() {
           <>
             {activeTab === 'overview' && <OverviewPanel modelState={modelState!} training={training} />}
             {activeTab === 'train' && <TrainPanel training={training} setTraining={setTraining} onStart={startTraining} onStop={stopTraining} modelState={modelState!} />}
-            {activeTab === 'generate' && <GeneratePanel prompt={prompt} setPrompt={setPrompt} generatedText={generatedText} isGenerating={isGenerating} temperature={temperature} setTemperature={setTemperature} maxTokens={maxTokens} setMaxTokens={setMaxTokens} onGenerate={generateText} modelState={modelState!} />}
+            {activeTab === 'generate' && <GeneratePanel prompt={prompt} setPrompt={setPrompt} generatedText={generatedText} isGenerating={isGenerating} temperature={temperature} setTemperature={setTemperature} maxTokens={maxTokens} setMaxTokens={setMaxTokens} onGenerate={generateText} modelState={modelState!} atomicMind={atomicMind!} wordPredictor={wordPredictor!} dictionary={dictionary!} selfVetter={selfVetter!} />}
+            {activeTab === 'mind' && <AtomicMindPanel atomicMind={atomicMind!} />}
+            {activeTab === 'predict' && <WordPredictPanel wordPredictor={wordPredictor!} dictionary={dictionary!} selfVetter={selfVetter!} />}
             {activeTab === 'architecture' && <ArchitecturePanel />}
             {activeTab === 'export' && <ExportPanel model={model!} onDownload={downloadWeights} />}
           </>
@@ -567,7 +588,7 @@ function TrainPanel({ training, setTraining, onStart, onStop, modelState }: {
 }
 
 // ============ GENERATE PANEL ============
-function GeneratePanel({ prompt, setPrompt, generatedText, isGenerating, temperature, setTemperature, maxTokens, setMaxTokens, onGenerate, modelState }: any) {
+function GeneratePanel({ prompt, setPrompt, generatedText, isGenerating, temperature, setTemperature, maxTokens, setMaxTokens, onGenerate, modelState, atomicMind, wordPredictor, dictionary, selfVetter }: any) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
       <div className="md:col-span-2 space-y-4">
@@ -786,6 +807,356 @@ function ExportPanel({ model, onDownload }: { model: ElasticTransformer; onDownl
           A single model that dynamically activates different amounts of its own parameters based on task complexity.
           All weights are open. Download, share, modify, or redistribute freely.
         </p>
+      </div>
+    </div>
+  );
+}
+
+// ============ ATOMIC MIND PANEL ============
+function AtomicMindPanel({ atomicMind }: { atomicMind: AtomicMindGraph }) {
+  const [selectedNode, setSelectedNode] = useState<string | null>(null);
+  const [zoomLevel, setZoomLevel] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  
+  const rootConcepts = atomicMind.getRootConcepts();
+  const searchResults = searchQuery ? atomicMind.search(searchQuery) : [];
+  const selectedNodeData = selectedNode ? atomicMind.zoomIn(selectedNode) : null;
+  const view = selectedNode ? atomicMind.getView(selectedNode, zoomLevel) : null;
+  const related = selectedNode ? atomicMind.getRelatedConcepts(selectedNode) : [];
+  const stats = atomicMind.getStats();
+
+  return (
+    <div className="space-y-6">
+      <div className="p-6 rounded-xl bg-gradient-to-r from-cyan-500/5 to-blue-500/5 border border-cyan-500/30">
+        <h3 className="text-lg font-bold text-white mb-2 flex items-center gap-2">
+          <span className="text-2xl">🧠</span>
+          Atomic Mind Graph
+        </h3>
+        <p className="text-gray-400 text-sm">
+          A graph-based knowledge structure with zoomable detail levels. Click any concept to zoom in for atomic notes.
+          This enables unlimited context through hierarchical knowledge mapping.
+        </p>
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800 text-center">
+          <div className="text-2xl font-bold text-cyan-400">{stats.nodes}</div>
+          <div className="text-xs text-gray-500">Knowledge Atoms</div>
+        </div>
+        <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800 text-center">
+          <div className="text-2xl font-bold text-cyan-400">{stats.edges}</div>
+          <div className="text-xs text-gray-500">Connections</div>
+        </div>
+        <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800 text-center">
+          <div className="text-2xl font-bold text-cyan-400">{zoomLevel}</div>
+          <div className="text-xs text-gray-500">Zoom Level</div>
+        </div>
+      </div>
+
+      {/* Search */}
+      <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800">
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="Search knowledge graph..."
+          className="w-full px-4 py-2 rounded-lg bg-gray-800 border border-gray-700 text-white text-sm focus:border-cyan-500/50 focus:outline-none"
+        />
+        {searchResults.length > 0 && (
+          <div className="mt-3 space-y-2">
+            {searchResults.map((node) => (
+              <button
+                key={node.id}
+                onClick={() => { setSelectedNode(node.id); setZoomLevel(0); }}
+                className="w-full text-left p-3 rounded-lg bg-gray-800/50 border border-gray-700 hover:border-cyan-500/30 transition-colors"
+              >
+                <div className="font-medium text-white text-sm">{node.concept}</div>
+                <div className="text-xs text-gray-400 mt-1">{node.summary}</div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Root concepts */}
+        <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+          <h4 className="font-bold text-white mb-4">Root Concepts</h4>
+          <div className="space-y-2">
+            {rootConcepts.map((node) => (
+              <button
+                key={node.id}
+                onClick={() => { setSelectedNode(node.id); setZoomLevel(0); }}
+                className={`w-full text-left p-3 rounded-lg border transition-colors ${
+                  selectedNode === node.id
+                    ? 'bg-cyan-500/10 border-cyan-500/30'
+                    : 'bg-gray-800/50 border-gray-700 hover:border-gray-600'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="font-medium text-white text-sm">{node.concept}</div>
+                  <div className="text-xs text-cyan-400">{(node.importance * 100).toFixed(0)}%</div>
+                </div>
+                <div className="text-xs text-gray-400 mt-1">{node.summary}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Detail view */}
+        <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+          {selectedNode && view ? (
+            <>
+              <div className="flex items-center justify-between mb-4">
+                <h4 className="font-bold text-white">{selectedNodeData?.concept}</h4>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setZoomLevel(Math.max(0, zoomLevel - 1))}
+                    className="px-2 py-1 rounded bg-gray-700 text-xs text-gray-300 hover:bg-gray-600"
+                  >
+                    Zoom Out
+                  </button>
+                  <button
+                    onClick={() => setZoomLevel(zoomLevel + 1)}
+                    className="px-2 py-1 rounded bg-cyan-500/20 text-xs text-cyan-400 hover:bg-cyan-500/30"
+                  >
+                    Zoom In
+                  </button>
+                </div>
+              </div>
+              
+              <div className="mb-4">
+                <div className="text-sm text-gray-300">{view.summary}</div>
+              </div>
+
+              {view.details.length > 0 && (
+                <div className="mb-4">
+                  <div className="text-xs text-gray-500 mb-2">Atomic Notes (Zoom Level {zoomLevel})</div>
+                  <div className="space-y-2">
+                    {view.details.map((detail, i) => (
+                      <div key={i} className="p-2 rounded bg-gray-800/50 border border-gray-700 text-xs text-gray-300">
+                        {detail}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {related.length > 0 && (
+                <div>
+                  <div className="text-xs text-gray-500 mb-2">Related Concepts</div>
+                  <div className="flex flex-wrap gap-2">
+                    {related.map((node) => (
+                      <button
+                        key={node.id}
+                        onClick={() => { setSelectedNode(node.id); setZoomLevel(0); }}
+                        className="px-3 py-1 rounded-full bg-gray-800 border border-gray-700 text-xs text-gray-300 hover:border-cyan-500/30"
+                      >
+                        {node.concept}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="flex items-center justify-center h-full text-gray-600 text-sm">
+              Select a concept to view details
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============ WORD PREDICT PANEL ============
+function WordPredictPanel({ wordPredictor, dictionary, selfVetter }: {
+  wordPredictor: WordPredictor;
+  dictionary: DictionaryEngine;
+  selfVetter: SelfVetter;
+}) {
+  const [inputText, setInputText] = useState('');
+  const [predictions, setPredictions] = useState<any[]>([]);
+  const [dictMatches, setDictMatches] = useState<any[]>([]);
+  const [vetResult, setVetResult] = useState<any>(null);
+  const [selectedCategory, setSelectedCategory] = useState<string>('common');
+
+  const predictWords = useCallback(() => {
+    if (!inputText) return;
+    const preds = wordPredictor.predict(inputText);
+    setPredictions(preds);
+    
+    const matches = dictionary.findMatches(inputText, selectedCategory);
+    setDictMatches(matches);
+  }, [inputText, selectedCategory, wordPredictor, dictionary]);
+
+  const vetText = useCallback(() => {
+    if (!inputText) return;
+    const result = selfVetter.vet(inputText);
+    setVetResult(result);
+  }, [inputText, selfVetter]);
+
+  const predictorStats = wordPredictor.getStats();
+  const dictStats = dictionary.getStats();
+  const vetterStats = selfVetter.getStats();
+
+  return (
+    <div className="space-y-6">
+      <div className="p-6 rounded-xl bg-gradient-to-r from-amber-500/5 to-orange-500/5 border border-amber-500/30">
+        <h3 className="text-lg font-bold text-white mb-2 flex items-center gap-2">
+          <span className="text-2xl">⚡</span>
+          Smart Prediction & Self-Correction
+        </h3>
+        <p className="text-gray-400 text-sm">
+          Automated word prediction that saves tokens. AI approves or swaps predictions.
+          Self-vetter validates output and self-learns from corrections.
+        </p>
+      </div>
+
+      {/* Stats */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800 text-center">
+          <div className="text-2xl font-bold text-amber-400">{predictorStats.totalCorrections}</div>
+          <div className="text-xs text-gray-500">Self-Corrections</div>
+        </div>
+        <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800 text-center">
+          <div className="text-2xl font-bold text-amber-400">{wordPredictor.getVocabularySize()}</div>
+          <div className="text-xs text-gray-500">Vocabulary</div>
+        </div>
+        <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800 text-center">
+          <div className="text-2xl font-bold text-amber-400">{dictStats.totalPhrases}</div>
+          <div className="text-xs text-gray-500">Dictionary Phrases</div>
+        </div>
+        <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800 text-center">
+          <div className="text-2xl font-bold text-amber-400">{vetterStats.totalVetted}</div>
+          <div className="text-xs text-gray-500">Texts Vetted</div>
+        </div>
+      </div>
+
+      {/* Input */}
+      <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+        <label className="text-sm text-gray-400 block mb-2">Type to see predictions</label>
+        <textarea
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          placeholder="Start typing..."
+          className="w-full h-24 px-4 py-3 rounded-lg bg-gray-800 border border-gray-700 text-white resize-none focus:border-amber-500/50 focus:outline-none"
+        />
+        <div className="flex gap-2 mt-3">
+          <button onClick={predictWords} className="px-4 py-2 bg-amber-500/20 border border-amber-500/30 rounded-lg text-amber-400 text-sm hover:bg-amber-500/30">
+            ⚡ Predict Words
+          </button>
+          <button onClick={vetText} className="px-4 py-2 bg-green-500/20 border border-green-500/30 rounded-lg text-green-400 text-sm hover:bg-green-500/30">
+            ✅ Vet Text
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        {/* Predictions */}
+        <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+          <h4 className="font-bold text-white mb-4">Word Predictions</h4>
+          {predictions.length > 0 ? (
+            <div className="space-y-2">
+              {predictions.map((pred, i) => (
+                <div key={i} className="p-3 rounded-lg bg-gray-800/50 border border-gray-700">
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium text-white text-sm">{pred.word}</span>
+                    <span className="text-xs text-amber-400">{(pred.confidence * 100).toFixed(0)}%</span>
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">~{pred.tokenCount} tokens</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-gray-600 text-sm text-center py-8">Type and click Predict</div>
+          )}
+        </div>
+
+        {/* Dictionary */}
+        <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+          <h4 className="font-bold text-white mb-4">Dictionary Phrases</h4>
+          <div className="flex gap-1 mb-3 flex-wrap">
+            {['common', 'code', 'technical', 'creative', 'formal'].map((cat) => (
+              <button
+                key={cat}
+                onClick={() => setSelectedCategory(cat)}
+                className={`px-2 py-1 rounded text-xs ${
+                  selectedCategory === cat
+                    ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                    : 'bg-gray-800 text-gray-400 border border-gray-700'
+                }`}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+          {dictMatches.length > 0 ? (
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {dictMatches.map((match, i) => (
+                <button
+                  key={i}
+                  onClick={() => setInputText(inputText + ' ' + match.phrase)}
+                  className="w-full text-left p-2 rounded bg-gray-800/50 border border-gray-700 hover:border-amber-500/30 text-xs text-gray-300"
+                >
+                  {match.phrase}
+                  <span className="text-gray-500 ml-2">({match.tokenCount} tok)</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="text-gray-600 text-sm text-center py-8">
+              {dictStats.categories[selectedCategory] || 0} phrases available
+            </div>
+          )}
+        </div>
+
+        {/* Vet Result */}
+        <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+          <h4 className="font-bold text-white mb-4">Self-Vet Result</h4>
+          {vetResult ? (
+            <div className="space-y-3">
+              <div className={`p-3 rounded-lg border ${
+                vetResult.isValid
+                  ? 'bg-green-500/5 border-green-500/20'
+                  : 'bg-red-500/5 border-red-500/20'
+              }`}>
+                <div className={`font-medium text-sm ${vetResult.isValid ? 'text-green-400' : 'text-red-400'}`}>
+                  {vetResult.isValid ? '✅ Valid' : '❌ Issues Found'}
+                </div>
+                <div className="text-xs text-gray-400 mt-1">
+                  Confidence: {(vetResult.confidence * 100).toFixed(0)}%
+                </div>
+              </div>
+              
+              {vetResult.issues.length > 0 && (
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Issues:</div>
+                  {vetResult.issues.map((issue: string, i: number) => (
+                    <div key={i} className="text-xs text-red-400 mb-1">• {issue}</div>
+                  ))}
+                </div>
+              )}
+              
+              {vetResult.corrections.length > 0 && (
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Corrections:</div>
+                  {vetResult.corrections.map((corr: string, i: number) => (
+                    <div key={i} className="text-xs text-amber-400 mb-1">→ {corr.slice(0, 50)}...</div>
+                  ))}
+                </div>
+              )}
+              
+              {vetResult.learned && (
+                <div className="text-xs text-cyan-400">🧠 Self-learning triggered</div>
+              )}
+            </div>
+          ) : (
+            <div className="text-gray-600 text-sm text-center py-8">Click Vet Text to validate</div>
+          )}
+        </div>
       </div>
     </div>
   );
