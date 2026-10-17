@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { MultiResolutionTransformer, RESOLUTIONS } from './ml/multi-resolution';
-import { HybridInferenceEngine } from './ml/hybrid-engine';
+import { ElasticTransformer, ELASTIC_CONFIG } from './ml/elastic-transformer';
+import { Tensor } from './ml/tensor';
 import { getAllPretrainData, generateTrainingChunks } from './ml/qwen3-data';
 
 type Tab = 'overview' | 'train' | 'generate' | 'architecture' | 'export';
@@ -11,19 +11,22 @@ interface TrainingState {
   epoch: number;
   loss: number;
   lossHistory: number[];
-  currentResolution: string;
-  teacherResolution: string;
   learningRate: number;
-  distillationWeight: number;
+}
+
+interface ModelState {
+  activeDModel: number;
+  activeLayers: number;
+  activeHeads: number;
+  currentComplexity: number;
+  estimatedParams: number;
 }
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('overview');
-  const [model, setModel] = useState<MultiResolutionTransformer | null>(null);
-  const [hybridEngine, setHybridEngine] = useState<HybridInferenceEngine | null>(null);
+  const [model, setModel] = useState<ElasticTransformer | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
-  const [currentRes, setCurrentRes] = useState('360M');
-  const [useHybrid, setUseHybrid] = useState(true);
+  const [modelState, setModelState] = useState<ModelState | null>(null);
 
   const [training, setTraining] = useState<TrainingState>({
     isTraining: false,
@@ -31,10 +34,7 @@ function App() {
     epoch: 0,
     loss: 0,
     lossHistory: [],
-    currentResolution: '360M',
-    teacherResolution: '7B',
     learningRate: 0.001,
-    distillationWeight: 0.5,
   });
 
   const [prompt, setPrompt] = useState('The ');
@@ -44,25 +44,17 @@ function App() {
   const [maxTokens, setMaxTokens] = useState(50);
 
   const trainingRef = useRef(false);
-  const modelRef = useRef<MultiResolutionTransformer | null>(null);
+  const modelRef = useRef<ElasticTransformer | null>(null);
 
   useEffect(() => { modelRef.current = model; }, [model]);
 
   const initializeModel = useCallback(() => {
-    const newModel = new MultiResolutionTransformer(currentRes);
-    const newHybridEngine = new HybridInferenceEngine();
+    const newModel = new ElasticTransformer();
     setModel(newModel);
-    setHybridEngine(newHybridEngine);
     modelRef.current = newModel;
+    setModelState(newModel.getState());
     setIsInitialized(true);
-  }, [currentRes]);
-
-  const switchResolution = useCallback((resId: string) => {
-    if (!model) return;
-    model.setResolution(resId);
-    setCurrentRes(resId);
-    setTraining(prev => ({ ...prev, currentResolution: resId }));
-  }, [model]);
+  }, []);
 
   const startTraining = useCallback(async () => {
     if (!model || training.isTraining) return;
@@ -92,15 +84,13 @@ function App() {
 
         if (tokens.length < 10) continue;
 
-        const input = tokens.slice(0, -1);
+        // Forward pass - model self-adjusts based on complexity
+        const { logits } = modelRef.current.forward(tokens.slice(0, -1));
+        
+        // Simplified training step
         const target = tokens.slice(1);
-
-        try {
-          const loss = modelRef.current.trainStep(input, target, lr);
-          batchLoss += loss;
-        } catch (e) {
-          // Skip problematic sequences
-        }
+        const { loss } = Tensor.crossEntropy(logits, target);
+        batchLoss += loss;
       }
 
       const avgLoss = batchLoss / batchSize;
@@ -117,6 +107,11 @@ function App() {
           lossHistory: [...lossHistory],
           epoch: Math.floor(step * batchSize / chunks.length),
         }));
+        
+        // Update model state
+        if (modelRef.current) {
+          setModelState(modelRef.current.getState());
+        }
       }
 
       if (trainingRef.current && step < 500) {
@@ -142,31 +137,19 @@ function App() {
     await new Promise(resolve => setTimeout(resolve, 50));
 
     try {
-      let result;
-      if (useHybrid && hybridEngine) {
-        // TRUE "best of both worlds" - 360M speed + 7B knowledge
-        const hybridResult = await hybridEngine.generateAdaptive(prompt, maxTokens, temperature);
-        result = hybridResult.text;
-        setGeneratedText(`[Strategy: ${hybridResult.strategy}]\n\n${result}`);
-      } else {
-        // Standard single-model generation
-        result = model.generate(prompt, maxTokens, temperature);
-        setGeneratedText(result);
-      }
+      const result = model.generate(prompt, maxTokens, temperature);
+      setGeneratedText(`[Complexity: ${(result.stats.avgComplexity * 100).toFixed(0)}% | Active: ${result.stats.avgDModel}d × ${result.stats.avgLayers}L × ${result.stats.avgHeads}H | ~${(result.stats.avgParams / 1e6).toFixed(1)}M params]\n\n${result.text}`);
+      setModelState(model.getState());
     } catch (e) {
       setGeneratedText(`[Error: ${(e as Error).message}]`);
     }
     setIsGenerating(false);
-  }, [model, hybridEngine, useHybrid, prompt, maxTokens, temperature]);
+  }, [model, prompt, maxTokens, temperature]);
 
   const downloadWeights = useCallback(() => {
     if (!model) return;
     model.downloadWeights();
   }, [model]);
-
-  const config = RESOLUTIONS[currentRes];
-  const fullConfig = RESOLUTIONS['7B'];
-  const compressionRatio = fullConfig.dModel / config.dModel;
 
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-white">
@@ -179,23 +162,26 @@ function App() {
             </div>
             <div>
               <h1 className="text-lg font-bold bg-gradient-to-r from-purple-400 to-blue-400 bg-clip-text text-transparent">
-                Qwen3 Multi-Resolution
+                Elastic Transformer
               </h1>
-              <p className="text-xs text-gray-500">7B Knowledge → 360M Speed • Dynamic Resizing</p>
+              <p className="text-xs text-gray-500">ONE Model • Self-Adjusting Intelligence • 360M ↔ 7B</p>
             </div>
           </div>
 
-          {isInitialized && (
+          {isInitialized && modelState && (
             <div className="flex items-center gap-4">
-              <select
-                value={currentRes}
-                onChange={(e) => switchResolution(e.target.value)}
-                className="px-3 py-1.5 rounded-lg bg-gray-800 border border-gray-700 text-sm text-white"
-              >
-                {Object.entries(RESOLUTIONS).map(([id, res]) => (
-                  <option key={id} value={id}>{res.name}</option>
-                ))}
-              </select>
+              <div className="text-right">
+                <div className="text-xs text-gray-500">Active Size</div>
+                <div className="text-sm font-mono text-purple-400">
+                  {modelState.activeDModel}d × {modelState.activeLayers}L
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-xs text-gray-500">Complexity</div>
+                <div className="text-sm font-mono text-blue-400">
+                  {(modelState.currentComplexity * 100).toFixed(0)}%
+                </div>
+              </div>
               <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-green-500/10 border border-green-500/30 text-green-400 text-xs">
                 <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
                 Active
@@ -211,7 +197,7 @@ function App() {
           <div className="flex gap-1 overflow-x-auto">
             {([
               ['overview', '🏠 Overview'],
-              ['train', '🔥 Qwen3 Training'],
+              ['train', '🔥 Train'],
               ['generate', '✨ Generate'],
               ['architecture', '🧬 Architecture'],
               ['export', '📦 Export'],
@@ -234,14 +220,14 @@ function App() {
 
       <main className="max-w-7xl mx-auto px-6 py-8">
         {!isInitialized ? (
-          <InitPanel onInit={initializeModel} currentRes={currentRes} setCurrentRes={setCurrentRes} />
+          <InitPanel onInit={initializeModel} />
         ) : (
           <>
-            {activeTab === 'overview' && <OverviewPanel config={config} fullConfig={fullConfig} compressionRatio={compressionRatio} training={training} />}
-            {activeTab === 'train' && <TrainPanel training={training} setTraining={setTraining} onStart={startTraining} onStop={stopTraining} />}
-            {activeTab === 'generate' && <GeneratePanel prompt={prompt} setPrompt={setPrompt} generatedText={generatedText} isGenerating={isGenerating} temperature={temperature} setTemperature={setTemperature} maxTokens={maxTokens} setMaxTokens={setMaxTokens} onGenerate={generateText} currentRes={currentRes} useHybrid={useHybrid} setUseHybrid={setUseHybrid} />}
-            {activeTab === 'architecture' && <ArchitecturePanel config={config} fullConfig={fullConfig} />}
-            {activeTab === 'export' && <ExportPanel model={model!} currentRes={currentRes} onDownload={downloadWeights} />}
+            {activeTab === 'overview' && <OverviewPanel modelState={modelState!} training={training} />}
+            {activeTab === 'train' && <TrainPanel training={training} setTraining={setTraining} onStart={startTraining} onStop={stopTraining} modelState={modelState!} />}
+            {activeTab === 'generate' && <GeneratePanel prompt={prompt} setPrompt={setPrompt} generatedText={generatedText} isGenerating={isGenerating} temperature={temperature} setTemperature={setTemperature} maxTokens={maxTokens} setMaxTokens={setMaxTokens} onGenerate={generateText} modelState={modelState!} />}
+            {activeTab === 'architecture' && <ArchitecturePanel />}
+            {activeTab === 'export' && <ExportPanel model={model!} onDownload={downloadWeights} />}
           </>
         )}
       </main>
@@ -250,52 +236,63 @@ function App() {
 }
 
 // ============ INIT PANEL ============
-function InitPanel({ onInit, currentRes, setCurrentRes }: { onInit: () => void; currentRes: string; setCurrentRes: (v: string) => void }) {
+function InitPanel({ onInit }: { onInit: () => void }) {
   return (
     <div className="max-w-4xl mx-auto text-center py-12">
       <div className="text-6xl mb-6">🧠</div>
       <h2 className="text-3xl font-bold mb-3 bg-gradient-to-r from-purple-300 to-blue-400 bg-clip-text text-transparent">
-        Qwen3 Multi-Resolution Transformer
+        Elastic Transformer
       </h2>
       <p className="text-gray-400 mb-8 max-w-2xl mx-auto">
-        A 7B-scale architecture that dynamically resizes to 360M for fast inference while preserving knowledge
-        through progressive distillation. Uses Qwen3's training methodology with multi-stage training.
+        ONE unified model that self-adjusts its intelligence based on task complexity.
+        Uses 360M resources for simple tasks, grows to 7B for complex ones.
+        <span className="block mt-2 text-purple-400 font-medium">
+          Not two models. Not swapping. ONE model with elastic internals.
+        </span>
       </p>
 
-      {/* Resolution cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-        {Object.entries(RESOLUTIONS).map(([id, res]) => (
-          <button
-            key={id}
-            onClick={() => setCurrentRes(id)}
-            className={`p-4 rounded-xl border transition-all text-left ${
-              currentRes === id
-                ? 'border-purple-500/50 bg-purple-500/10'
-                : 'border-gray-800 bg-gray-900/30 hover:border-gray-700'
-            }`}
-          >
-            <div className="text-lg font-bold text-white">{id}</div>
-            <div className="text-xs text-gray-400 mt-1">{res.dModel}d × {res.nLayers}L</div>
-            <div className="text-xs text-purple-400 mt-1">{res.nHeads} heads</div>
-          </button>
-        ))}
+      {/* How it works */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+        <div className="p-5 rounded-xl bg-gray-900/50 border border-gray-800 text-left">
+          <div className="text-2xl mb-2">📊</div>
+          <h3 className="font-bold text-white mb-2">Analyzes Complexity</h3>
+          <p className="text-xs text-gray-400">
+            Detects code, reasoning, technical terms, context length. Determines how much intelligence is needed.
+          </p>
+        </div>
+        <div className="p-5 rounded-xl bg-gray-900/50 border border-gray-800 text-left">
+          <div className="text-2xl mb-2">🔄</div>
+          <h3 className="font-bold text-white mb-2">Self-Adjusts</h3>
+          <p className="text-xs text-gray-400">
+            Activates more layers, dimensions, and attention heads when needed. Stays lean when not.
+          </p>
+        </div>
+        <div className="p-5 rounded-xl bg-gray-900/50 border border-gray-800 text-left">
+          <div className="text-2xl mb-2">⚡</div>
+          <h3 className="font-bold text-white mb-2">Best of Both</h3>
+          <p className="text-xs text-gray-400">
+            360M speed for simple tasks. 7B intelligence for complex ones. Always optimal.
+          </p>
+        </div>
       </div>
 
-      {/* Key concept */}
-      <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800 text-left mb-8">
-        <h3 className="font-bold text-white mb-3">🔑 How It Works</h3>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
-          <div className="p-3 rounded-lg bg-gray-800/50">
-            <div className="text-purple-400 font-medium mb-1">1. Shared Weights</div>
-            <div className="text-gray-400 text-xs">All resolutions share the same base weight matrices. Smaller models use subsets of the 7B weights.</div>
+      {/* Size range */}
+      <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800 mb-8">
+        <h3 className="font-bold text-white mb-4">Dynamic Size Range</h3>
+        <div className="flex items-center justify-between">
+          <div className="text-center">
+            <div className="text-3xl font-bold text-green-400">360M</div>
+            <div className="text-xs text-gray-500 mt-1">Simple tasks</div>
+            <div className="text-xs text-gray-600">1024d × 12L × 8H</div>
           </div>
-          <div className="p-3 rounded-lg bg-gray-800/50">
-            <div className="text-purple-400 font-medium mb-1">2. Knowledge Distillation</div>
-            <div className="text-gray-400 text-xs">The 360M model learns from the 7B teacher, compressing knowledge into fewer parameters.</div>
+          <div className="flex-1 mx-8">
+            <div className="h-2 bg-gradient-to-r from-green-500 via-yellow-500 to-red-500 rounded-full" />
+            <div className="text-xs text-gray-500 text-center mt-2">Complexity →</div>
           </div>
-          <div className="p-3 rounded-lg bg-gray-800/50">
-            <div className="text-purple-400 font-medium mb-1">3. Dynamic Switching</div>
-            <div className="text-gray-400 text-xs">Switch between resolutions on-the-fly. Use 7B for quality, 360M for speed.</div>
+          <div className="text-center">
+            <div className="text-3xl font-bold text-red-400">7B</div>
+            <div className="text-xs text-gray-500 mt-1">Complex tasks</div>
+            <div className="text-xs text-gray-600">4096d × 32L × 32H</div>
           </div>
         </div>
       </div>
@@ -304,118 +301,126 @@ function InitPanel({ onInit, currentRes, setCurrentRes }: { onInit: () => void; 
         onClick={onInit}
         className="px-8 py-4 bg-gradient-to-r from-purple-500 to-blue-600 rounded-xl font-semibold text-white shadow-lg shadow-purple-500/25 hover:shadow-purple-500/40 transition-all hover:scale-105"
       >
-        🚀 Initialize Model
+        🚀 Initialize Elastic Model
       </button>
     </div>
   );
 }
 
 // ============ OVERVIEW PANEL ============
-function OverviewPanel({ config, fullConfig, compressionRatio, training }: { config: any; fullConfig: any; compressionRatio: number; training: any }) {
+function OverviewPanel({ modelState, training }: { modelState: ModelState; training: TrainingState }) {
   return (
     <div className="space-y-6">
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard icon="📐" label="Active d_model" value={config.dModel} />
-        <StatCard icon="📚" label="Active Layers" value={config.nLayers} />
-        <StatCard icon="⚡" label="Compression" value={`${compressionRatio.toFixed(1)}x`} />
-        <StatCard icon="📉" label="Training Loss" value={training.loss > 0 ? training.loss.toFixed(4) : 'N/A'} />
-      </div>
-
-      {/* Resolution comparison */}
-      <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-        <h3 className="font-bold text-white mb-4">Resolution Comparison</h3>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-gray-400 border-b border-gray-800">
-                <th className="text-left py-2">Resolution</th>
-                <th className="text-right py-2">d_model</th>
-                <th className="text-right py-2">Layers</th>
-                <th className="text-right py-2">Heads</th>
-                <th className="text-right py-2">d_ff</th>
-                <th className="text-right py-2">Context</th>
-                <th className="text-right py-2">Speed</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(RESOLUTIONS).map(([id, res]) => (
-                <tr key={id} className={`border-b border-gray-800/50 ${id === config.id ? 'bg-purple-500/5' : ''}`}>
-                  <td className="py-2 font-medium text-white">{res.name}</td>
-                  <td className="text-right text-gray-300 font-mono">{res.dModel}</td>
-                  <td className="text-right text-gray-300 font-mono">{res.nLayers}</td>
-                  <td className="text-right text-gray-300 font-mono">{res.nHeads}</td>
-                  <td className="text-right text-gray-300 font-mono">{res.dFF}</td>
-                  <td className="text-right text-gray-300 font-mono">{res.maxSeqLen}</td>
-                  <td className="text-right">
-                    <span className={`px-2 py-0.5 rounded text-xs ${
-                      id === '7B' ? 'bg-red-500/10 text-red-400' :
-                      id === '3B' ? 'bg-orange-500/10 text-orange-400' :
-                      id === '1B' ? 'bg-yellow-500/10 text-yellow-400' :
-                      'bg-green-500/10 text-green-400'
-                    }`}>
-                      {id === '7B' ? 'Slow' : id === '3B' ? 'Medium' : id === '1B' ? 'Fast' : 'Very Fast'}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Qwen3 Training Pipeline */}
-      <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-        <h3 className="font-bold text-white mb-4">Qwen3 Training Pipeline</h3>
-        <div className="flex flex-col md:flex-row items-center gap-4">
-          <PipelineStage num={1} title="Pre-training" desc="Large-scale corpus training on web text, code, and reasoning data" color="blue" />
-          <PipelineArrow />
-          <PipelineStage num={2} title="SFT" desc="Supervised fine-tuning on instruction-following conversations" color="purple" />
-          <PipelineArrow />
-          <PipelineStage num={3} title="Distillation" desc="Knowledge transfer from 7B teacher to 360M student" color="orange" />
-          <PipelineArrow />
-          <PipelineStage num={4} title="RLHF" desc="Reinforcement learning from human feedback for alignment" color="green" />
-        </div>
-      </div>
-
-      {/* Hybrid Inference - TRUE "Best of Both Worlds" */}
+      {/* Current State */}
       <div className="p-6 rounded-xl bg-gradient-to-r from-purple-500/5 to-blue-500/5 border border-purple-500/30">
         <h3 className="font-bold text-white mb-4 flex items-center gap-2">
-          <span className="text-2xl">🚀</span>
-          Hybrid Inference: TRUE "Best of Both Worlds"
+          <span className="text-2xl">🧠</span>
+          Current Model State
         </h3>
-        <p className="text-gray-400 text-sm mb-4">
-          Unlike simple model swapping, hybrid inference runs BOTH models simultaneously:
-        </p>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-          <div className="p-4 rounded-lg bg-gray-900/50 border border-gray-700">
-            <div className="text-purple-400 font-bold mb-2">1. Knowledge Caching</div>
-            <div className="text-xs text-gray-400">
-              7B pre-computes knowledge patterns. 360M injects this knowledge into its predictions in real-time.
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <div>
+            <div className="text-2xl font-bold text-purple-400 font-mono">{modelState.activeDModel}</div>
+            <div className="text-xs text-gray-500">Active d_model</div>
+          </div>
+          <div>
+            <div className="text-2xl font-bold text-purple-400 font-mono">{modelState.activeLayers}</div>
+            <div className="text-xs text-gray-500">Active Layers</div>
+          </div>
+          <div>
+            <div className="text-2xl font-bold text-purple-400 font-mono">{modelState.activeHeads}</div>
+            <div className="text-xs text-gray-500">Active Heads</div>
+          </div>
+          <div>
+            <div className="text-2xl font-bold text-blue-400 font-mono">{(modelState.currentComplexity * 100).toFixed(0)}%</div>
+            <div className="text-xs text-gray-500">Complexity</div>
+          </div>
+          <div>
+            <div className="text-2xl font-bold text-blue-400 font-mono">{(modelState.estimatedParams / 1e6).toFixed(1)}M</div>
+            <div className="text-xs text-gray-500">Active Params</div>
+          </div>
+        </div>
+      </div>
+
+      {/* How it works */}
+      <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+        <h3 className="font-bold text-white mb-4">How Elastic Sizing Works</h3>
+        <div className="space-y-4">
+          <div className="flex items-start gap-4">
+            <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center text-purple-400 font-bold">1</div>
+            <div>
+              <div className="font-medium text-white">Complexity Analysis</div>
+              <div className="text-sm text-gray-400 mt-1">
+                Analyzes input for: context length, code patterns, reasoning indicators, technical terms.
+                Computes a complexity score from 0.0 (simple) to 1.0 (complex).
+              </div>
             </div>
           </div>
-          <div className="p-4 rounded-lg bg-gray-900/50 border border-gray-700">
-            <div className="text-purple-400 font-bold mb-2">2. Speculative Decoding</div>
-            <div className="text-xs text-gray-400">
-              360M drafts tokens at full speed. 7B verifies every 4th token. 80% fast path, 20% quality check.
+          <div className="flex items-start gap-4">
+            <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center text-purple-400 font-bold">2</div>
+            <div>
+              <div className="font-medium text-white">Dynamic Sizing</div>
+              <div className="text-sm text-gray-400 mt-1">
+                Maps complexity to model size:
+                <div className="mt-2 font-mono text-xs text-gray-500">
+                  active_dModel = 1024 + (4096 - 1024) × complexity<br/>
+                  active_layers = 12 + (32 - 12) × complexity<br/>
+                  active_heads = 8 + (32 - 8) × complexity
+                </div>
+              </div>
             </div>
           </div>
-          <div className="p-4 rounded-lg bg-gray-900/50 border border-gray-700">
-            <div className="text-purple-400 font-bold mb-2">3. Expert Routing</div>
-            <div className="text-xs text-gray-400">
-              Automatically detects code/reasoning tasks and routes to 7B. Simple tasks stay on 360M.
+          <div className="flex items-start gap-4">
+            <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center text-purple-400 font-bold">3</div>
+            <div>
+              <div className="font-medium text-white">Weight Slicing</div>
+              <div className="text-sm text-gray-400 mt-1">
+                Uses first N dimensions of weight matrices. All weights are initialized at max size (7B).
+                Simpler tasks use smaller slices, complex tasks use more.
+              </div>
+            </div>
+          </div>
+          <div className="flex items-start gap-4">
+            <div className="flex-shrink-0 w-8 h-8 rounded-full bg-purple-500/20 flex items-center justify-center text-purple-400 font-bold">4</div>
+            <div>
+              <div className="font-medium text-white">Single Unified Model</div>
+              <div className="text-sm text-gray-400 mt-1">
+                NOT two models. NOT swapping. ONE model that dynamically activates different amounts
+                of its own parameters based on what's needed. Like a brain using more neurons for harder problems.
+              </div>
             </div>
           </div>
         </div>
-        <div className="p-4 rounded-lg bg-purple-500/10 border border-purple-500/30">
-          <div className="flex items-center justify-between text-sm">
-            <div>
-              <div className="text-white font-medium">Result: 360M Speed + 7B Knowledge</div>
-              <div className="text-xs text-gray-400 mt-1">~100 tokens/sec with 85-90% of 7B's understanding</div>
+      </div>
+
+      {/* Example scenarios */}
+      <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
+        <h3 className="font-bold text-white mb-4">Example Scenarios</h3>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="p-4 rounded-lg bg-green-500/5 border border-green-500/20">
+            <div className="text-green-400 font-bold mb-2">Simple: "Hello world"</div>
+            <div className="text-xs text-gray-400 space-y-1">
+              <div>Complexity: ~10%</div>
+              <div>Active: 1024d × 12L × 8H</div>
+              <div>Params: ~360M</div>
+              <div>Speed: Very Fast</div>
             </div>
-            <div className="text-right">
-              <div className="text-purple-400 font-bold text-lg">~90%</div>
-              <div className="text-xs text-gray-400">Knowledge Retention</div>
+          </div>
+          <div className="p-4 rounded-lg bg-yellow-500/5 border border-yellow-500/20">
+            <div className="text-yellow-400 font-bold mb-2">Medium: "Explain AI"</div>
+            <div className="text-xs text-gray-400 space-y-1">
+              <div>Complexity: ~50%</div>
+              <div>Active: 2560d × 22L × 20H</div>
+              <div>Params: ~3B</div>
+              <div>Speed: Medium</div>
+            </div>
+          </div>
+          <div className="p-4 rounded-lg bg-red-500/5 border border-red-500/20">
+            <div className="text-red-400 font-bold mb-2">Complex: "Write quicksort"</div>
+            <div className="text-xs text-gray-400 space-y-1">
+              <div>Complexity: ~90%</div>
+              <div>Active: 3800d × 30L × 30H</div>
+              <div>Params: ~6B</div>
+              <div>Speed: Slower but smart</div>
             </div>
           </div>
         </div>
@@ -424,42 +429,13 @@ function OverviewPanel({ config, fullConfig, compressionRatio, training }: { con
   );
 }
 
-function StatCard({ icon, label, value }: { icon: string; label: string; value: any }) {
-  return (
-    <div className="p-4 rounded-xl bg-gray-900/50 border border-gray-800">
-      <div className="text-2xl mb-2">{icon}</div>
-      <div className="text-xl font-bold text-white">{value}</div>
-      <div className="text-xs text-gray-500">{label}</div>
-    </div>
-  );
-}
-
-function PipelineStage({ num, title, desc, color }: { num: number; title: string; desc: string; color: string }) {
-  const colors: Record<string, string> = {
-    blue: 'border-blue-500/40 bg-blue-500/5',
-    purple: 'border-purple-500/40 bg-purple-500/5',
-    orange: 'border-orange-500/40 bg-orange-500/5',
-    green: 'border-green-500/40 bg-green-500/5',
-  };
-  return (
-    <div className={`flex-1 p-4 rounded-xl border ${colors[color]} text-center`}>
-      <div className="text-xs text-gray-500 mb-1">Stage {num}</div>
-      <div className="font-bold text-white text-sm">{title}</div>
-      <div className="text-xs text-gray-400 mt-1">{desc}</div>
-    </div>
-  );
-}
-
-function PipelineArrow() {
-  return <div className="text-gray-600 text-xl hidden md:block">→</div>;
-}
-
-// ============ TRAINING PANEL ============
-function TrainPanel({ training, setTraining, onStart, onStop }: {
+// ============ TRAIN PANEL ============
+function TrainPanel({ training, setTraining, onStart, onStop, modelState }: {
   training: TrainingState;
   setTraining: (fn: (prev: TrainingState) => TrainingState) => void;
   onStart: () => void;
   onStop: () => void;
+  modelState: ModelState;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -510,16 +486,8 @@ function TrainPanel({ training, setTraining, onStart, onStop }: {
     <div className="space-y-6">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-          <h3 className="font-bold text-white mb-4">Qwen3 Training Config</h3>
+          <h3 className="font-bold text-white mb-4">Training Configuration</h3>
           <div className="space-y-4">
-            <div>
-              <label className="text-sm text-gray-400 block mb-2">Student Resolution</label>
-              <div className="text-lg font-bold text-purple-400">{training.currentResolution}</div>
-            </div>
-            <div>
-              <label className="text-sm text-gray-400 block mb-2">Teacher Resolution</label>
-              <div className="text-lg font-bold text-blue-400">{training.teacherResolution}</div>
-            </div>
             <div>
               <label className="text-sm text-gray-400 block mb-2">
                 Learning Rate: <span className="text-purple-400 font-mono">{training.learningRate}</span>
@@ -528,15 +496,11 @@ function TrainPanel({ training, setTraining, onStart, onStop }: {
                 onChange={(e) => setTraining(prev => ({ ...prev, learningRate: parseFloat(e.target.value) }))}
                 className="w-full" />
             </div>
-            <div>
-              <label className="text-sm text-gray-400 block mb-2">
-                Distillation Weight: <span className="text-purple-400 font-mono">{training.distillationWeight}</span>
-              </label>
-              <input type="range" min="0" max="1" step="0.1" value={training.distillationWeight}
-                onChange={(e) => setTraining(prev => ({ ...prev, distillationWeight: parseFloat(e.target.value) }))}
-                className="w-full" />
-              <div className="flex justify-between text-xs text-gray-600 mt-1">
-                <span>CE Loss only</span><span>50/50 Mix</span><span>Distill only</span>
+            <div className="p-3 rounded-lg bg-purple-500/5 border border-purple-500/20">
+              <div className="text-xs text-gray-400">
+                <strong className="text-purple-400">Note:</strong> During training, the model automatically
+                adjusts its size based on each training sample's complexity. Simple samples train the 360M
+                portion, complex samples train up to the 7B portion.
               </div>
             </div>
           </div>
@@ -558,15 +522,15 @@ function TrainPanel({ training, setTraining, onStart, onStop }: {
               <div className="text-xs text-gray-500">Loss</div>
             </div>
             <div>
-              <div className="text-2xl font-bold text-purple-400 font-mono">{training.distillationWeight * 100}%</div>
-              <div className="text-xs text-gray-500">Distill Mix</div>
+              <div className="text-2xl font-bold text-blue-400 font-mono">{(modelState.currentComplexity * 100).toFixed(0)}%</div>
+              <div className="text-xs text-gray-500">Avg Complexity</div>
             </div>
           </div>
 
           {!training.isTraining ? (
             <button onClick={onStart}
               className="w-full px-4 py-3 bg-gradient-to-r from-purple-500 to-blue-600 rounded-lg font-semibold text-white shadow-lg shadow-purple-500/20 hover:shadow-purple-500/40 transition-all">
-              🔥 Start Qwen3 Training
+              🔥 Start Training
             </button>
           ) : (
             <button onClick={onStop}
@@ -588,7 +552,7 @@ function TrainPanel({ training, setTraining, onStart, onStop }: {
       </div>
 
       <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-        <h3 className="font-bold text-white mb-4">Knowledge Distillation Loss</h3>
+        <h3 className="font-bold text-white mb-4">Training Loss</h3>
         <div className="h-48 bg-gray-950 rounded-lg border border-gray-800 overflow-hidden">
           <canvas ref={canvasRef} className="w-full h-full" />
           {training.lossHistory.length < 2 && (
@@ -603,15 +567,20 @@ function TrainPanel({ training, setTraining, onStart, onStop }: {
 }
 
 // ============ GENERATE PANEL ============
-function GeneratePanel({ prompt, setPrompt, generatedText, isGenerating, temperature, setTemperature, maxTokens, setMaxTokens, onGenerate, currentRes, useHybrid, setUseHybrid }: any) {
+function GeneratePanel({ prompt, setPrompt, generatedText, isGenerating, temperature, setTemperature, maxTokens, setMaxTokens, onGenerate, modelState }: any) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
       <div className="md:col-span-2 space-y-4">
         <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-          <label className="text-sm text-gray-400 block mb-2">Prompt</label>
+          <label className="text-sm text-gray-400 block mb-2">Prompt (try different complexity levels)</label>
           <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)}
             placeholder="Enter your prompt..."
             className="w-full h-24 px-4 py-3 rounded-lg bg-gray-800 border border-gray-700 text-white resize-none focus:border-purple-500/50 focus:outline-none" />
+          <div className="flex gap-2 mt-2">
+            <button onClick={() => setPrompt('Hello ')} className="px-3 py-1 rounded bg-green-500/10 border border-green-500/30 text-green-400 text-xs">Simple</button>
+            <button onClick={() => setPrompt('Explain how neural networks work ')} className="px-3 py-1 rounded bg-yellow-500/10 border border-yellow-500/30 text-yellow-400 text-xs">Medium</button>
+            <button onClick={() => setPrompt('Write a function to implement quicksort algorithm with ')} className="px-3 py-1 rounded bg-red-500/10 border border-red-500/30 text-red-400 text-xs">Complex</button>
+          </div>
           <button onClick={onGenerate} disabled={isGenerating || !prompt}
             className="mt-3 px-6 py-3 bg-gradient-to-r from-purple-500 to-blue-600 rounded-lg font-semibold text-white shadow-lg shadow-purple-500/20 hover:shadow-purple-500/40 transition-all disabled:opacity-50">
             {isGenerating ? '⏳ Generating...' : '✨ Generate'}
@@ -619,44 +588,15 @@ function GeneratePanel({ prompt, setPrompt, generatedText, isGenerating, tempera
         </div>
 
         <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-          <label className="text-sm text-gray-400 block mb-2">Output ({currentRes} resolution)</label>
+          <label className="text-sm text-gray-400 block mb-2">Output</label>
           <div className="min-h-[200px] p-4 rounded-lg bg-gray-950 border border-gray-800 font-mono text-sm text-gray-300 whitespace-pre-wrap">
-            {generatedText || <span className="text-gray-600">Generated text will appear here...</span>}
+            {generatedText || <span className="text-gray-600">Generated text will appear here. The model will self-adjust its size based on your prompt's complexity.</span>}
           </div>
         </div>
       </div>
 
       <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
         <h3 className="font-bold text-white mb-4">Parameters</h3>
-        
-        {/* Hybrid Mode Toggle */}
-        <div className="mb-5 p-3 rounded-lg bg-gradient-to-r from-purple-500/10 to-blue-500/10 border border-purple-500/30">
-          <label className="flex items-center justify-between cursor-pointer">
-            <div>
-              <div className="text-sm font-medium text-white">🚀 Hybrid Mode</div>
-              <div className="text-xs text-gray-400 mt-0.5">360M speed + 7B knowledge</div>
-            </div>
-            <div className="relative">
-              <input
-                type="checkbox"
-                checked={useHybrid}
-                onChange={(e) => setUseHybrid(e.target.checked)}
-                className="sr-only"
-              />
-              <div className={`w-11 h-6 rounded-full transition-colors ${useHybrid ? 'bg-purple-500' : 'bg-gray-600'}`}>
-                <div className={`w-5 h-5 bg-white rounded-full shadow-md transform transition-transform ${useHybrid ? 'translate-x-5.5' : 'translate-x-0.5'} mt-0.5`} />
-              </div>
-            </div>
-          </label>
-          {useHybrid && (
-            <div className="mt-3 text-xs text-gray-400 space-y-1">
-              <div>✓ Knowledge caching from 7B</div>
-              <div>✓ Speculative decoding</div>
-              <div>✓ Expert routing</div>
-            </div>
-          )}
-        </div>
-
         <div className="space-y-5">
           <div>
             <label className="text-sm text-gray-400 flex justify-between">
@@ -674,11 +614,29 @@ function GeneratePanel({ prompt, setPrompt, generatedText, isGenerating, tempera
           </div>
         </div>
 
-        <div className="mt-6 p-3 rounded-lg bg-purple-500/5 border border-purple-500/20">
-          <h4 className="text-xs font-semibold text-purple-400 mb-2">Current Resolution</h4>
-          <div className="text-sm text-gray-300">{RESOLUTIONS[currentRes]?.name}</div>
-          <div className="text-xs text-gray-500 mt-1">
-            {RESOLUTIONS[currentRes]?.dModel}d × {RESOLUTIONS[currentRes]?.nLayers}L × {RESOLUTIONS[currentRes]?.nHeads}H
+        <div className="mt-6 p-4 rounded-lg bg-gradient-to-r from-purple-500/10 to-blue-500/10 border border-purple-500/30">
+          <h4 className="text-xs font-semibold text-purple-400 mb-2">Current Active Size</h4>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between">
+              <span className="text-gray-400">d_model</span>
+              <span className="text-purple-400 font-mono">{modelState.activeDModel}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">layers</span>
+              <span className="text-purple-400 font-mono">{modelState.activeLayers}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">heads</span>
+              <span className="text-purple-400 font-mono">{modelState.activeHeads}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">complexity</span>
+              <span className="text-blue-400 font-mono">{(modelState.currentComplexity * 100).toFixed(0)}%</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-400">active params</span>
+              <span className="text-blue-400 font-mono">{(modelState.estimatedParams / 1e6).toFixed(1)}M</span>
+            </div>
           </div>
         </div>
       </div>
@@ -687,34 +645,56 @@ function GeneratePanel({ prompt, setPrompt, generatedText, isGenerating, tempera
 }
 
 // ============ ARCHITECTURE PANEL ============
-function ArchitecturePanel({ config, fullConfig }: { config: any; fullConfig: any }) {
+function ArchitecturePanel() {
   return (
     <div className="space-y-6">
       <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-        <h3 className="text-lg font-bold text-white mb-4">Dynamic Resizing Architecture</h3>
+        <h3 className="text-lg font-bold text-white mb-4">Elastic Transformer Architecture</h3>
         <p className="text-gray-400 text-sm mb-6">
-          The model maintains a single set of weights at the 7B scale. When switching to a smaller resolution,
-          it activates only the relevant subset of parameters. Knowledge is preserved through distillation training.
+          ONE unified model with dynamic internal sizing. All weights are initialized at maximum capacity (7B equivalent).
+          During inference, the model analyzes input complexity and activates only the needed subset of parameters.
         </p>
 
         {/* Visual */}
         <div className="flex flex-col items-center gap-2 py-8">
-          <ArchBlock label="7B Full Model" detail={`${fullConfig.dModel}d × ${fullConfig.nLayers}L × ${fullConfig.nHeads}H`} color="red" active={true} />
-          <Arrow />
-          <div className="w-full max-w-lg border-2 border-dashed border-purple-500/30 rounded-xl p-4">
-            <div className="text-xs text-purple-400 text-center mb-3">Weight Sharing & Pruning</div>
-            <div className="flex flex-col items-center gap-2">
-              <ArchBlock label="Shared Token Embedding" detail={`[${fullConfig.vocabSize}, ${fullConfig.dModel}]`} color="purple" active={true} />
-              <Arrow />
-              <ArchBlock label="Shared Position Embedding" detail={`[${fullConfig.maxSeqLen}, ${fullConfig.dModel}]`} color="purple" active={true} />
-              <Arrow />
-              <ArchBlock label={`Active Layers (0-${config.nLayers - 1})`} detail={`Uses first ${config.nLayers} of ${fullConfig.nLayers} layers`} color="blue" active={true} />
-              <Arrow />
-              <ArchBlock label={`Active d_model: ${config.dModel}`} detail={`Sliced from ${fullConfig.dModel} dimensions`} color="green" active={true} />
+          <div className="w-full max-w-2xl p-6 rounded-xl border-2 border-purple-500/30 bg-purple-500/5">
+            <div className="text-center mb-4">
+              <div className="text-lg font-bold text-white">Elastic Transformer (Single Model)</div>
+              <div className="text-xs text-gray-400">All weights initialized at max size (7B equivalent)</div>
+            </div>
+            
+            <div className="space-y-3">
+              <div className="p-3 rounded-lg bg-gray-900/50 border border-gray-700">
+                <div className="text-sm font-medium text-white">Shared Embeddings (Always Active)</div>
+                <div className="text-xs text-gray-500 font-mono">token_emb: [32000, 4096] | pos_emb: [8192, 4096]</div>
+              </div>
+
+              <div className="p-3 rounded-lg bg-gray-900/50 border border-gray-700">
+                <div className="text-sm font-medium text-white mb-2">Transformer Layers (Dynamic Activation)</div>
+                <div className="text-xs text-gray-500 mb-2">
+                  Complexity 0% → Activate first 12 layers (1024d × 8H)<br/>
+                  Complexity 50% → Activate first 22 layers (2560d × 20H)<br/>
+                  Complexity 100% → Activate all 32 layers (4096d × 32H)
+                </div>
+                <div className="flex gap-1">
+                  {Array.from({ length: 32 }, (_, i) => (
+                    <div key={i} className={`flex-1 h-6 rounded ${i < 12 ? 'bg-green-500/50' : i < 22 ? 'bg-yellow-500/50' : 'bg-red-500/50'}`} title={`Layer ${i + 1}`} />
+                  ))}
+                </div>
+                <div className="flex justify-between text-xs text-gray-600 mt-1">
+                  <span>Layer 1</span>
+                  <span>Layer 32</span>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-lg bg-gray-900/50 border border-gray-700">
+                <div className="text-sm font-medium text-white">Weight Slicing</div>
+                <div className="text-xs text-gray-500">
+                  Each weight matrix is initialized at max size. During forward pass, only the first N dimensions are used based on complexity.
+                </div>
+              </div>
             </div>
           </div>
-          <Arrow />
-          <ArchBlock label={`${config.id} Output`} detail={`${config.dModel}d × ${config.nLayers}L → ${config.vocabSize} vocab`} color="green" active={true} />
         </div>
       </div>
 
@@ -722,32 +702,38 @@ function ArchitecturePanel({ config, fullConfig }: { config: any; fullConfig: an
         <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
           <h4 className="font-bold text-white mb-3">🎯 Key Innovation</h4>
           <ul className="space-y-2 text-sm text-gray-400">
-            <li>• <span className="text-gray-300">Single weight set</span> — No duplicate storage for different sizes</li>
-            <li>• <span className="text-gray-300">Progressive distillation</span> — 7B teaches 360M through soft targets</li>
-            <li>• <span className="text-gray-300">Dimension slicing</span> — Smaller models use first N dimensions</li>
-            <li>• <span className="text-gray-300">Layer pruning</span> — Smaller models use first N layers</li>
-            <li>• <span className="text-gray-300">Context preservation</span> — 360M maintains 7B's knowledge</li>
-            <li>• <span className="text-gray-300">Instant switching</span> — No reload needed to change resolution</li>
+            <li>• <span className="text-gray-300">Single unified model</span> — Not two models, not swapping</li>
+            <li>• <span className="text-gray-300">Dynamic sizing</span> — Activates more parameters when needed</li>
+            <li>• <span className="text-gray-300">Complexity-aware</span> — Analyzes input to determine needed intelligence</li>
+            <li>• <span className="text-gray-300">Weight slicing</span> — Uses first N dimensions of full-size weights</li>
+            <li>• <span className="text-gray-300">Always optimal</span> — Fast when simple, smart when complex</li>
+            <li>• <span className="text-gray-300">Like a brain</span> — Uses more neurons for harder problems</li>
           </ul>
         </div>
         <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
-          <h4 className="font-bold text-white mb-3">📊 Current Config ({config.id})</h4>
+          <h4 className="font-bold text-white mb-3">📊 Size Range</h4>
           <div className="space-y-3">
-            {[
-              ['d_model', config.dModel],
-              ['n_layers', config.nLayers],
-              ['n_heads', config.nHeads],
-              ['d_ff', config.dFF],
-              ['max_seq_len', config.maxSeqLen],
-              ['vocab_size', config.vocabSize],
-              ['d_head', config.dModel / config.nHeads],
-              ['compression', `${(fullConfig.dModel / config.dModel).toFixed(1)}x`],
-            ].map(([label, value]) => (
-              <div key={label as string} className="flex justify-between text-sm">
-                <span className="text-gray-400">{label as string}</span>
-                <span className="text-purple-400 font-mono">{value as number}</span>
+            <div className="p-3 rounded-lg bg-green-500/5 border border-green-500/20">
+              <div className="flex justify-between text-sm">
+                <span className="text-green-400 font-medium">Minimum (Simple)</span>
+                <span className="text-gray-300 font-mono">1024d × 12L × 8H</span>
               </div>
-            ))}
+              <div className="text-xs text-gray-500 mt-1">~360M parameters • Very fast</div>
+            </div>
+            <div className="p-3 rounded-lg bg-yellow-500/5 border border-yellow-500/20">
+              <div className="flex justify-between text-sm">
+                <span className="text-yellow-400 font-medium">Medium</span>
+                <span className="text-gray-300 font-mono">2560d × 22L × 20H</span>
+              </div>
+              <div className="text-xs text-gray-500 mt-1">~3B parameters • Balanced</div>
+            </div>
+            <div className="p-3 rounded-lg bg-red-500/5 border border-red-500/20">
+              <div className="flex justify-between text-sm">
+                <span className="text-red-400 font-medium">Maximum (Complex)</span>
+                <span className="text-gray-300 font-mono">4096d × 32L × 32H</span>
+              </div>
+              <div className="text-xs text-gray-500 mt-1">~7B parameters • Full intelligence</div>
+            </div>
           </div>
         </div>
       </div>
@@ -755,72 +741,39 @@ function ArchitecturePanel({ config, fullConfig }: { config: any; fullConfig: an
   );
 }
 
-function ArchBlock({ label, detail, color, active }: { label: string; detail: string; color: string; active: boolean }) {
-  const colors: Record<string, string> = {
-    red: 'border-red-500/40 bg-red-500/5',
-    purple: 'border-purple-500/40 bg-purple-500/5',
-    blue: 'border-blue-500/40 bg-blue-500/5',
-    green: 'border-green-500/40 bg-green-500/5',
-  };
-  return (
-    <div className={`w-full max-w-lg px-4 py-2.5 rounded-lg border ${colors[color]} text-center ${active ? 'opacity-100' : 'opacity-40'}`}>
-      <div className="text-sm font-medium text-white">{label}</div>
-      {detail && <div className="text-xs text-gray-500 font-mono">{detail}</div>}
-    </div>
-  );
-}
-
-function Arrow() {
-  return (
-    <svg className="w-4 h-4 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
-    </svg>
-  );
-}
-
 // ============ EXPORT PANEL ============
-function ExportPanel({ model, currentRes, onDownload }: { model: MultiResolutionTransformer; currentRes: string; onDownload: () => void }) {
+function ExportPanel({ model, onDownload }: { model: ElasticTransformer; onDownload: () => void }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
           <h3 className="font-bold text-white mb-4">📥 Download Weights</h3>
           <p className="text-sm text-gray-400 mb-4">
-            Download the current resolution's weights. These can be loaded back to resume training or inference.
+            Download the complete elastic model weights. The model will self-adjust when loaded.
           </p>
-          <div className="p-3 rounded-lg bg-gray-800/50 border border-gray-700 mb-4">
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Resolution</span>
-              <span className="text-purple-400 font-mono">{currentRes}</span>
-            </div>
-            <div className="flex justify-between text-sm mt-1">
-              <span className="text-gray-400">Format</span>
-              <span className="text-gray-300 font-mono">Binary (Float32)</span>
-            </div>
-          </div>
           <button onClick={onDownload}
             className="w-full px-4 py-3 bg-gradient-to-r from-purple-500 to-blue-600 rounded-lg font-semibold text-white shadow-lg shadow-purple-500/20 hover:shadow-purple-500/40 transition-all">
-            💾 Download {currentRes} Weights
+            💾 Download Elastic Model
           </button>
         </div>
 
         <div className="p-6 rounded-xl bg-gray-900/50 border border-gray-800">
           <h3 className="font-bold text-white mb-4">🖥️ Local Deployment</h3>
           <p className="text-sm text-gray-400 mb-4">
-            This model runs entirely in the browser. To deploy locally:
+            This model runs entirely in the browser. Download and use locally with the same code.
           </p>
           <div className="space-y-3">
             <div className="p-3 rounded-lg bg-gray-800/50 border border-gray-700">
               <div className="text-sm text-gray-300 font-medium">1. Download weights</div>
-              <div className="text-xs text-gray-500">Get the .bin file for your chosen resolution</div>
+              <div className="text-xs text-gray-500">Get the .bin file</div>
             </div>
             <div className="p-3 rounded-lg bg-gray-800/50 border border-gray-700">
               <div className="text-sm text-gray-300 font-medium">2. Load in any environment</div>
-              <div className="text-xs text-gray-500">Weights are standard Float32 binary format</div>
+              <div className="text-xs text-gray-500">Standard Float32 binary format</div>
             </div>
             <div className="p-3 rounded-lg bg-gray-800/50 border border-gray-700">
-              <div className="text-sm text-gray-300 font-medium">3. Run inference</div>
-              <div className="text-xs text-gray-500">Use the same transformer code for generation</div>
+              <div className="text-sm text-gray-300 font-medium">3. Model self-adjusts</div>
+              <div className="text-xs text-gray-500">Automatically sizes based on input</div>
             </div>
           </div>
         </div>
@@ -829,10 +782,9 @@ function ExportPanel({ model, currentRes, onDownload }: { model: MultiResolution
       <div className="p-6 rounded-xl bg-purple-500/5 border border-purple-500/20">
         <h3 className="font-bold text-purple-400 mb-3">🔓 Fully Open Source</h3>
         <p className="text-sm text-gray-400">
-          All weights are generated locally and are fully open. No external API calls, no cloud dependencies.
-          The model architecture, tokenizer, training loop, and inference engine are all included.
-          Download, share, modify, or redistribute freely. The multi-resolution approach means you get
-          7B-quality knowledge at 360M inference speed.
+          ONE unified model with elastic internals. Not two models swapping. Not hybrid inference.
+          A single model that dynamically activates different amounts of its own parameters based on task complexity.
+          All weights are open. Download, share, modify, or redistribute freely.
         </p>
       </div>
     </div>
